@@ -1,5 +1,4 @@
 using Azure.Messaging.ServiceBus;
-using Microsoft.Azure.Cosmos;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.DurableTask;
 using Microsoft.Azure.WebJobs.Extensions.Http;
@@ -97,14 +96,14 @@ namespace CampaignList
                 return "Failed";
             }
 
-            Container cosmosContainer = null;
+            ServiceBusClient serviceBusClient = null;
             try
             {
-                cosmosContainer = GetCosmosContainer();
+                serviceBusClient = GetServiceBusClient();
             }
             catch (Exception ex)
             {
-                log.LogError($"Failed to initialize Cosmos DB {ex}");
+                log.LogError($"Failed to initialize Service Bus {ex}");
                 return "Failed";
             }
 
@@ -178,43 +177,74 @@ namespace CampaignList
                             if (pageCollection.Entities.Count > 0)
                             {
                                 int pageRecordCount = 1;
-                                var batch = cosmosContainer.CreateTransactionalBatch(new PartitionKey(blobName));
-
+                                List<Task> tasks = new List<Task>();
+                                List<ServiceBusMessage> contactListRecords = new List<ServiceBusMessage>();
                                 foreach (var contact in pageCollection.Entities)
                                 {
-                                    EmailListDto contactListRecord = new()
-                                    {
-                                        CampaignId = blobName
-                                    };
-
                                     if (isDynamic)
                                     {
-                                        contactListRecord.RecipientEmailAddress = contact.Attributes["emailaddress1"].ToString();
-                                        contactListRecord.RecipientFullName = contact.Attributes["fullname"].ToString();
+                                        var recipientEmailAddress = contact.Attributes["emailaddress1"].ToString();
+                                        var emailDto = new EmailListDto
+                                        {
+                                            CampaignId = blobName,
+                                            RecipientEmailAddress = recipientEmailAddress,
+                                            RecipientFullName = contact.Attributes["fullname"].ToString(),
+                                            Status = IsAlreadyMailed(recipientEmailAddress) ? DeliveryStatus.Completed.ToString() : DeliveryStatus.NotStarted.ToString()
+                                        };
+                                        ServiceBusMessage serviceBusMessage = new ServiceBusMessage(JsonConvert.SerializeObject(emailDto));
+                                        serviceBusMessage.MessageId = recipientEmailAddress;
+                                        contactListRecords.Add(serviceBusMessage);
                                     }
                                     else
                                     {
-                                        contactListRecord.RecipientEmailAddress = ((AliasedValue)contact.Attributes["Contact.emailaddress1"]).Value.ToString();
-                                        contactListRecord.RecipientFullName = ((AliasedValue)contact.Attributes["Contact.fullname"]).Value.ToString();
+                                        var recipientEmailAddress = ((AliasedValue)contact.Attributes["Contact.emailaddress1"]).Value.ToString();
+                                        var emailDto = new EmailListDto
+                                        {
+                                            CampaignId = blobName,
+                                            RecipientEmailAddress = recipientEmailAddress,
+                                            RecipientFullName = ((AliasedValue)contact.Attributes["Contact.fullname"]).Value.ToString(),
+                                            Status = IsAlreadyMailed(recipientEmailAddress) ? DeliveryStatus.Completed.ToString() : DeliveryStatus.NotStarted.ToString()
+                                        };
+                                        ServiceBusMessage serviceBusMessage = new ServiceBusMessage(JsonConvert.SerializeObject(emailDto));
+                                        serviceBusMessage.MessageId = recipientEmailAddress;
+                                        contactListRecords.Add(serviceBusMessage);
                                     }
-
-                                    contactListRecord.Status = IsAlreadyMailed(contactListRecord.RecipientEmailAddress) ? DeliveryStatus.Completed.ToString() : DeliveryStatus.NotStarted.ToString();
 
                                     if (pageRecordCount == 100)
                                     {
-                                        await ExecuteBatchAsync(batch, log, pageRecordCount);
-                                        batch = cosmosContainer.CreateTransactionalBatch(new PartitionKey(blobName));
+                                        ServiceBusSender serviceBusSender = null;
+                                        try
+                                        {
+                                            serviceBusSender = GetServiceBusSender(serviceBusClient);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            log.LogError($"Failed to get Service Bus Sender {ex}");
+                                            return "Failed";
+                                        }
+                                        tasks.Add(ExecuteBatchAsync(serviceBusSender, contactListRecords, log));
                                         pageRecordCount = 1;
                                     }
 
                                     pageRecordCount++;
                                     totalContactCount++;
-                                    batch.CreateItem(contactListRecord);
                                 }
 
-                                if (pageRecordCount > 1 && pageRecordCount < 100)
+                                Task.WaitAll(tasks.ToArray());
+
+                                if (pageRecordCount > 1)
                                 {
-                                    await ExecuteBatchAsync(batch, log, pageRecordCount);
+                                    ServiceBusSender serviceBusSender = null;
+                                    try
+                                    {
+                                        serviceBusSender = GetServiceBusSender(serviceBusClient);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        log.LogError($"Failed to get Service Bus Sender {ex}");
+                                        return "Failed";
+                                    }
+                                    await ExecuteBatchAsync(serviceBusSender, contactListRecords, log);
                                 }
                             }
 
@@ -272,45 +302,17 @@ namespace CampaignList
         }
 
         private static async Task ExecuteBatchAsync(
-            TransactionalBatch batch,
-            ILogger log,
-            int recordCount)
+            ServiceBusSender serviceBusSender,
+            List<ServiceBusMessage> contactListRecords,
+            ILogger log)
         {
-            var response = await batch.ExecuteAsync();
-            if (response.IsSuccessStatusCode)
+            try
             {
-                log.LogInformation($"*******************Successfully added {recordCount} contacts to CosmosDb*******************");
+                await serviceBusSender.SendMessagesAsync(contactListRecords);
             }
-            else
+            catch (Exception ex)
             {
-                Dictionary<HttpStatusCode, int> results = new();
-                foreach (var operation in response)
-                {
-                    if (results.ContainsKey(operation.StatusCode))
-                    {
-                        results[operation.StatusCode]++;
-                    }
-                    else
-                    {
-                        results[operation.StatusCode] = 1;
-                    }
-
-                }
-                foreach (var result in results)
-                {
-                    if (result.Key == HttpStatusCode.Created)
-                    {
-                        log.LogInformation($"*******************Successfully added {result.Value} contacts to CosmosDb*******************");
-                    }
-                    else if (result.Key == HttpStatusCode.Conflict)
-                    {
-                        log.LogWarning($"*******************Found {result.Value} duplicate contacts that were fetched from Dataverse.*******************");
-                    }
-                    else
-                    {
-                        log.LogError($"*******************Failed to add {result.Value} contacts to CosmosDb with error code: {result.Key}*******************");
-                    }
-                }
+                log.LogError("Error while trying to upload a message batch to service bus. Error: " + ex);
             }
         }
 
@@ -604,16 +606,16 @@ namespace CampaignList
             return alreadySentEmails.Contains(emailAddress);
         }
 
-        private static CosmosClient InitializeCosmosClient()
+        private static ServiceBusClient GetServiceBusClient()
         {
-            string cosmosDbConnectionString = Environment.GetEnvironmentVariable("COSMOSDB_CONNECTION_STRING");
-            return new(cosmosDbConnectionString);
+            string serviceBusConnectionString = Environment.GetEnvironmentVariable("SERVICEBUS_CONNECTION_STRING");
+            return new ServiceBusClient(serviceBusConnectionString, new ServiceBusClientOptions() { TransportType = ServiceBusTransportType.AmqpWebSockets });
         }
 
-        private static Container GetCosmosContainer()
+        private static ServiceBusSender GetServiceBusSender(ServiceBusClient serviceBusClient)
         {
-            var cosmosClient = InitializeCosmosClient();
-            return cosmosClient.GetContainer("Campaign", "EmailList");
+            string serviceBusQueueName = Environment.GetEnvironmentVariable("SERVICEBUS_QUEUE_NAME");
+            return serviceBusClient.CreateSender(serviceBusQueueName);
         }
 
         private static string GetSerializedBlobDto(CampaignConfiguration campaignConfiguration)
