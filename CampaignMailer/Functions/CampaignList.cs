@@ -1,3 +1,4 @@
+using Azure.Communication.Email;
 using Azure.Messaging.ServiceBus;
 using Azure.Storage.Blobs;
 using CampaignMailer.Models;
@@ -168,7 +169,7 @@ namespace CampaignMailer.Functions
                             // Convert EntityCollection to JSON serializable object collection.
                             if (pageCollection.Entities.Count > 0)
                             {
-                                queueTasks.Add(QueueContactsAsync(pageCollection.Entities, campaignConfig.CampaignId, isDynamic, log));
+                                queueTasks.Add(QueueContactsAsync(pageCollection.Entities, campaignConfig, isDynamic, log));
                                 totalContactCount += pageCollection.Entities.Count;
                             }
 
@@ -226,7 +227,7 @@ namespace CampaignMailer.Functions
         /// <returns></returns>
         public static async Task QueueContactsAsync(
             DataCollection<Microsoft.Xrm.Sdk.Entity> contactList,
-            string campaignId,
+            CampaignConfiguration campaignConfig,
             bool isDynamic,
             ILogger log)
         {
@@ -235,31 +236,44 @@ namespace CampaignMailer.Functions
             // Iterate through EntityCollection and queue each campaign contact
             foreach (var contact in contactList)
             {
-                ServiceBusMessageDto contactListRecord = new()
-                {
-                    CampaignId = campaignId
-                };
+                var recipientInfo = GetRecipientInfo(isDynamic, contact);
 
-                if (isDynamic)
-                {
-                    contactListRecord.RecipientEmailAddress = contact.Attributes["emailaddress1"].ToString();
-                    contactListRecord.RecipientFullName = contact.Attributes["fullname"].ToString();
-                }
-                else
-                {
-                    contactListRecord.RecipientEmailAddress = ((AliasedValue)contact.Attributes["Contact.emailaddress1"]).Value.ToString();
-                    contactListRecord.RecipientFullName = ((AliasedValue)contact.Attributes["Contact.fullname"]).Value.ToString();
-                }
-
-                if (ShouldBlock(contactListRecord.RecipientEmailAddress))
+                if (ShouldBlock(recipientInfo.Address))
                 {
                     continue;
                 }
 
-                var message = new ServiceBusMessage(JsonConvert.SerializeObject(contactListRecord))
+                ServiceBusMessage message = null;
+
+                if (campaignConfig.ShouldUseBcc)
                 {
-                    MessageId = $"{contactListRecord.RecipientEmailAddress}_{campaignId}"
-                };
+                    var emailAddressServiceBusMessageDto = new EmailAddressServiceBusMessageDto
+                    {
+                        CampaignId = campaignConfig.CampaignId,
+                        RecipientAddress = recipientInfo
+                    };
+
+                    message = new ServiceBusMessage(JsonConvert.SerializeObject(emailAddressServiceBusMessageDto))
+                    {
+                        Subject = MessageType.Address.ToString()
+                    };
+                }
+                else
+                {
+                    var emailRequestServiceBusMessageDto = new EmailRequestServiceBusMessageDto
+                    {
+                        CampaignId = campaignConfig.CampaignId,
+                        EmailRecipients = new EmailRecipients(new List<EmailAddress> { recipientInfo }),
+                        OperationId = Guid.NewGuid().ToString()
+                    };
+
+                    message = new ServiceBusMessage(JsonConvert.SerializeObject(emailRequestServiceBusMessageDto))
+                    {
+                        Subject = MessageType.Request.ToString()
+                    };
+                }
+
+                message.MessageId = $"{recipientInfo.Address}_{campaignConfig.CampaignId}";
 
                 if (!messageBatch.TryAddMessage(message))
                 {
@@ -275,6 +289,22 @@ namespace CampaignMailer.Functions
                 await SendMessagesAsync(messageBatch, log);
                 messageBatch.Dispose();
             }
+        }
+
+        private static EmailAddress GetRecipientInfo(bool isDynamic, Microsoft.Xrm.Sdk.Entity contact)
+        {
+            EmailAddress recipientInfo;
+
+            if (isDynamic)
+            {
+                recipientInfo = new(contact.Attributes["emailaddress1"].ToString(), contact.Attributes["fullname"].ToString());
+            }
+            else
+            {
+                recipientInfo = new(((AliasedValue)contact.Attributes["Contact.emailaddress1"]).Value.ToString(), ((AliasedValue)contact.Attributes["Contact.fullname"]).Value.ToString());
+            }
+
+            return recipientInfo;
         }
 
         public static async Task SendMessagesAsync(ServiceBusMessageBatch messageBatch, ILogger log)
@@ -551,6 +581,7 @@ namespace CampaignMailer.Functions
                 SenderEmailAddress = campaignConfiguration.SenderEmailAddress,
                 ReplyToEmailAddress = campaignConfiguration.ReplyToEmailAddress,
                 ReplyToDisplayName = campaignConfiguration.ReplyToDisplayName,
+                MaxRecipientsPerSendMailRequest = campaignConfiguration.MaxRecipientsPerSendMailRequest,
             };
 
             return JsonConvert.SerializeObject(blobDto);

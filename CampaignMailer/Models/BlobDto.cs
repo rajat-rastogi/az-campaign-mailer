@@ -13,5 +13,7 @@
         public string ReplyToEmailAddress { get; set; }
 
         public string ReplyToDisplayName { get; set; }
+
+        public int MaxRecipientsPerSendMailRequest { get; set; }
     }
 }

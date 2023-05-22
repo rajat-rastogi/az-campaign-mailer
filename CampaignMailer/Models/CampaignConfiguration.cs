@@ -2,6 +2,8 @@
  * CampaignList function helper class.
  */
 
+using System;
+
 namespace CampaignMailer.Models
 {
     /// <summary>
@@ -26,5 +28,14 @@ namespace CampaignMailer.Models
         public string ReplyToEmailAddress { get; set; }
 
         public string ReplyToDisplayName { get; set; }
+
+        private int maxRecipientsPerSendMailRequest;
+        public int MaxRecipientsPerSendMailRequest
+        {
+            get { return maxRecipientsPerSendMailRequest; }
+            set { maxRecipientsPerSendMailRequest = Math.Min(Math.Max(value, 1), 50); }
+        }
+
+        public bool ShouldUseBcc => maxRecipientsPerSendMailRequest > 1;
     }
 }

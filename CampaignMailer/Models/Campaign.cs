@@ -1,4 +1,5 @@
 ﻿using Azure.Communication.Email;
+using Azure.Messaging.ServiceBus;
 using CampaignMailer.Utilities;
 using System.Collections.Generic;
 
@@ -9,6 +10,7 @@ namespace CampaignMailer.Models
         public Campaign(string id)
         {
             Id = id;
+            Recipients = new Dictionary<EmailAddress, ServiceBusReceivedMessage>(new EmailAddressEqualityComparer());
         }
 
         public string Id { get; }
@@ -19,6 +21,10 @@ namespace CampaignMailer.Models
 
         public string SenderEmailAddress { get; set; }
 
-        public HashSet<EmailAddress> RecipientsList { get; } = new HashSet<EmailAddress>(new EmailAddressEqualityComparer());
+        public int MaxRecipientsPerSendMailRequest { get; set; }
+
+        public bool ShouldUseBcc => MaxRecipientsPerSendMailRequest > 1;
+
+        public Dictionary<EmailAddress, ServiceBusReceivedMessage> Recipients { get; }
     }
 }

@@ -1,17 +1,21 @@
 using Azure;
 using Azure.Communication.Email;
 using Azure.Data.Tables;
+using Azure.Messaging.ServiceBus;
 using Azure.Storage.Blobs;
+using CampaignMailer.Exceptions;
 using CampaignMailer.Models;
-using Microsoft.Azure.ServiceBus;
+using CampaignMailer.Utilities;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,21 +24,18 @@ namespace CampaignMailer.Functions
 {
     public class CampaignMailer
     {
-        private readonly EmailClient emailClient;
         private readonly BlobContainerClient blobContainer;
         private readonly TableClient tableClient;
-        private readonly int numRecipientsPerRequest;
-        private readonly bool useBcc;
-        private readonly bool useSkipDeliveryHeader;
+        private readonly Mailer mailer;
+        private readonly ConcurrentDictionary<string, BlobDto> campaignBlobs;
+
 
         public CampaignMailer(IConfiguration configuration)
         {
-            emailClient = new EmailClient(configuration.GetConnectionStringOrSetting("COMMUNICATIONSERVICES_CONNECTION_STRING"));
+            mailer = new Mailer(configuration.GetConnectionStringOrSetting("COMMUNICATIONSERVICES_CONNECTION_STRING"), configuration.GetValue<int>("MaxRequestsPerMinute"));
             blobContainer = GetBlobContainer();
-            numRecipientsPerRequest = configuration.GetValue<int>("RecipientsPerSendMailRequest");
-            useBcc = numRecipientsPerRequest > 1;
-            useSkipDeliveryHeader = configuration.GetValue<bool>("UseSkipDeliveryHeader");
             tableClient = InitializeTableClient();
+            campaignBlobs = new ConcurrentDictionary<string, BlobDto>();
         }
 
         /// <summary>
@@ -45,7 +46,11 @@ namespace CampaignMailer.Functions
         /// <param name="log">The logger instance used to log messages and status.</param>
         /// <returns>The URLs to check the status of the function.</returns>
         [FunctionName("CampaignMailerSBTrigger")]
-        public async Task Run([ServiceBusTrigger("contactlist", Connection = "SERVICEBUS_CONNECTION_STRING")] Message[] messageList, ILogger log)
+        public async Task Run(
+            [ServiceBusTrigger("contactlist", Connection = "SERVICEBUS_CONNECTION_STRING")] ServiceBusReceivedMessage[] messageList,
+            ServiceBusSender serviceBusSender,
+            ServiceBusReceiver serviceBusReceiver,
+            ILogger log)
         {
             log.LogInformation($"Received {messageList.Length} messages from Service bus");
 
@@ -55,97 +60,219 @@ namespace CampaignMailer.Functions
             foreach (var message in messageList)
             {
                 var messageBody = Encoding.UTF8.GetString(message.Body);
-                var customer = JsonConvert.DeserializeObject<ServiceBusMessageDto>(messageBody);
 
-                // Add campaign to dictionary if it doesn't exists
-                if (!campaignDictionary.ContainsKey(customer.CampaignId))
+                if (string.Equals(message.Subject, MessageType.Request.ToString()))
                 {
-                    var emailBlobContent = await ReadEmailContentFromBlobStream(customer.CampaignId);
+                    var requestDetails = JsonConvert.DeserializeObject<EmailRequestServiceBusMessageDto>(messageBody);
 
-                    var newCampaign = new Campaign(customer.CampaignId)
+                    // Add campaign to dictionary if it doesn't exists
+                    if (!campaignDictionary.ContainsKey(requestDetails.CampaignId))
                     {
-                        EmailContent = new EmailContent(emailBlobContent.MessageSubject)
-                        {
-                            Html = emailBlobContent.MessageBodyHtml,
-                            PlainText = emailBlobContent.MessageBodyPlainText
-                        },
-                        ReplyTo = new EmailAddress(emailBlobContent.ReplyToEmailAddress, emailBlobContent.ReplyToDisplayName),
-                        SenderEmailAddress = emailBlobContent.SenderEmailAddress
-                    };
+                        campaignDictionary.Add(requestDetails.CampaignId, GetCampaign(requestDetails.CampaignId, await GetBlob(requestDetails.CampaignId)));
+                    }
 
-                    campaignDictionary.Add(customer.CampaignId, newCampaign);
+                    // Send the email
+                    sendMailTasks.Add(
+                        SendEmailAsync(
+                            campaignDictionary[requestDetails.CampaignId],
+                            requestDetails.EmailRecipients,
+                            requestDetails.OperationId,
+                            new List<ServiceBusReceivedMessage> { message },
+                            serviceBusSender,
+                            serviceBusReceiver,
+                            MessageType.Request,
+                            log));
                 }
-
-                // Get the campaign
-                var campaign = campaignDictionary[customer.CampaignId];
-
-                // Add email to the campaign to send
-                campaign.RecipientsList.Add(new EmailAddress(customer.RecipientEmailAddress));
-
-                // Send if the email is full
-                if (campaign.RecipientsList.Count == numRecipientsPerRequest)
+                else if (string.Equals(message.Subject, MessageType.Address.ToString()))
                 {
-                    EmailRecipients recipients = GetEmailRecipients(campaign.RecipientsList);
-                    sendMailTasks.Add(SendEmailAsync(campaign, recipients, log));
-                    campaign.RecipientsList.Clear();
+                    var recipientDetails = JsonConvert.DeserializeObject<EmailAddressServiceBusMessageDto>(messageBody);
+
+                    // Add campaign to dictionary if it doesn't exists
+                    if (!campaignDictionary.ContainsKey(recipientDetails.CampaignId))
+                    {
+                        campaignDictionary.Add(recipientDetails.CampaignId, GetCampaign(recipientDetails.CampaignId, await GetBlob(recipientDetails.CampaignId)));
+                    }
+
+                    // Get the campaign
+                    var campaign = campaignDictionary[recipientDetails.CampaignId];
+
+                    // Add email to the campaign to send
+                    campaign.Recipients.Add(recipientDetails.RecipientAddress, message);
+
+                    // Send if the email is full
+                    if (campaign.Recipients.Count == campaign.MaxRecipientsPerSendMailRequest)
+                    {
+                        EmailRecipients recipients = GetEmailRecipients(campaign);
+                        sendMailTasks.Add(
+                            SendEmailAsync(
+                                campaign,
+                                recipients,
+                                Guid.NewGuid().ToString(),
+                                new List<ServiceBusReceivedMessage>(campaign.Recipients.Values),
+                                serviceBusSender,
+                                serviceBusReceiver,
+                                MessageType.Address,
+                                log));
+                        campaign.Recipients.Clear();
+                    }
                 }
             }
 
             // send any remaining messages
             foreach (var campaign in campaignDictionary.Values)
             {
-                if (campaign.RecipientsList.Count > 0)
+                if (campaign.Recipients.Count > 0)
                 {
-                    EmailRecipients recipients = GetEmailRecipients(campaign.RecipientsList);
-                    sendMailTasks.Add(SendEmailAsync(campaign, recipients, log));
+                    EmailRecipients recipients = GetEmailRecipients(campaign);
+                    sendMailTasks.Add(
+                        SendEmailAsync(
+                            campaign,
+                            recipients,
+                            Guid.NewGuid().ToString(),
+                            new List<ServiceBusReceivedMessage>(campaign.Recipients.Values),
+                            serviceBusSender,
+                            serviceBusReceiver,
+                            MessageType.Address,
+                            log));
                 }
             }
 
             await Task.WhenAll(sendMailTasks);
         }
 
-        private async Task SendEmailAsync(Campaign campaign, EmailRecipients recipients, ILogger log)
+        private static Campaign GetCampaign(string campaignId, BlobDto blob)
         {
+            return new Campaign(campaignId)
+            {
+                EmailContent = new EmailContent(blob.MessageSubject)
+                {
+                    Html = blob.MessageBodyHtml,
+                    PlainText = blob.MessageBodyPlainText
+                },
+                ReplyTo = new EmailAddress(blob.ReplyToEmailAddress, blob.ReplyToDisplayName),
+                SenderEmailAddress = blob.SenderEmailAddress,
+                MaxRecipientsPerSendMailRequest = blob.MaxRecipientsPerSendMailRequest
+            };
+        }
+
+        private async Task SendEmailAsync(
+            Campaign campaign,
+            EmailRecipients recipients,
+            string operationId,
+            List<ServiceBusReceivedMessage> messages,
+            ServiceBusSender serviceBusSender,
+            ServiceBusReceiver serviceBusReceiver,
+            MessageType messageType,
+            ILogger log)
+        {
+            bool retriableError = false;
+            SendMailResponse response = null;
             try
             {
-                EmailMessage message = new(campaign.SenderEmailAddress, recipients, campaign.EmailContent);
-
-                // ***************** REMOVE *********************
-                if (useSkipDeliveryHeader)
-                {
-                    message.Headers.Add("x-ms-acsemail-loadtest-skip-email-delivery", "ACS");
-                }
-
                 var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
 
-                EmailSendOperation emailSendOperation = await emailClient.SendAsync(WaitUntil.Started, message, cts.Token);
-
-                await AddOperationStatusAsync(campaign.Id, recipients, emailSendOperation.Id);
+                // Send the email request
+                response = await mailer.SendAsync(campaign, recipients, operationId, cts.Token);
             }
-            catch (RequestFailedException ex)
+            catch (RateLimitExceededException)
             {
-                /// OperationID is contained in the exception message and can be used for troubleshooting purposes
-                log.LogError($"Email send operation failed with error code: {ex.ErrorCode}, message: {ex.Message}");
+                log.LogWarning($"Rate limit exceeded detected on the client. Not sending the request.");
+                retriableError = true;
             }
             catch (OperationCanceledException ocex)
             {
-                log.LogError($"Timeout Exception while sending email - {ocex}");
+                log.LogWarning($"Timeout Exception while sending email - {ocex}");
+                retriableError = true;
             }
             catch (Exception ex)
             {
-                log.LogError($"Exception while sending email - {ex}");
+                log.LogWarning($"Exception while sending email - {ex}");
+                retriableError = true;
+            }
+
+            if (response != null)
+            {
+                if (response.IsSuccessCode)
+                {
+                    // Add the operation status to the OperationStatus table
+                    await Task.WhenAll(
+                        new List<Task>
+                        {
+                            CompleteMessagesAsync(messages, serviceBusReceiver),
+                            AddOperationStatusAsync(campaign, recipients, operationId)
+                        });
+                }
+                else
+                {
+                    if (response.StatusCode == HttpStatusCode.BadRequest)
+                    {
+                        log.LogError($"SendMail response - {response}. OperationId: {operationId}. Non-retriable error detected. Cleaning up.");
+                        await CompleteMessagesAsync(messages, serviceBusReceiver);
+                    }
+                    else
+                    {
+                        log.LogWarning($"SendMail response - {response}. OperationId: {operationId}.");
+                        retriableError = true;
+                    }
+                } 
+            }
+
+            if (retriableError)
+            {
+                log.LogWarning("Retriable error detected. Waiting for 1 Minute before releasing the lock to retry");
+                await Task.Delay(TimeSpan.FromMinutes(1));
+
+                if (messageType == MessageType.Request)
+                {
+                    await AbandondMessagesAsync(messages, serviceBusReceiver);
+                }
+                else if (messageType == MessageType.Address)
+                {
+                    var tasks = new List<Task> { CompleteMessagesAsync(messages, serviceBusReceiver) };
+
+                    var emailRequestServiceBusMessageDto = new EmailRequestServiceBusMessageDto
+                    {
+                        CampaignId = campaign.Id,
+                        EmailRecipients = recipients,
+                        OperationId = operationId
+                    };
+                    var message = new ServiceBusMessage(JsonConvert.SerializeObject(emailRequestServiceBusMessageDto))
+                    {
+                        Subject = MessageType.Request.ToString()
+                    };
+
+                    tasks.Add(serviceBusSender.SendMessageAsync(message));
+                    await Task.WhenAll(tasks);
+                }
             }
         }
 
-        private async Task AddOperationStatusAsync(string campaignId, EmailRecipients recipients, string operationId)
+        private static async Task AbandondMessagesAsync(List<ServiceBusReceivedMessage> messages, ServiceBusReceiver serviceBusReceiver)
+        {
+            foreach (var message in messages)
+            {
+                await serviceBusReceiver.AbandonMessageAsync(message);
+            }
+        }
+
+        private static async Task CompleteMessagesAsync(List<ServiceBusReceivedMessage> messages, ServiceBusReceiver serviceBusReceiver)
+        {
+            // Explicitly call CompleteAsync on the serviceBusReceiver to remove the messages from the queue
+            foreach (var message in messages)
+            {
+                await serviceBusReceiver.CompleteMessageAsync(message);
+            }
+        }
+
+        private async Task AddOperationStatusAsync(Campaign campaign, EmailRecipients recipients, string operationId)
         {
             IEnumerable<OperationStatusEntity> operationStatusEntities;
 
-            if (useBcc)
+            if (campaign.ShouldUseBcc)
             {
                 operationStatusEntities = recipients.BCC.Select(recipient => new OperationStatusEntity
                 {
-                    CampaignId = campaignId,
+                    CampaignId = campaign.Id,
                     PartitionKey = recipient.Address,
                     RowKey = operationId,
                 });
@@ -154,7 +281,7 @@ namespace CampaignMailer.Functions
             {
                 operationStatusEntities = recipients.To.Select(recipient => new OperationStatusEntity
                 {
-                    CampaignId = campaignId,
+                    CampaignId = campaign.Id,
                     PartitionKey = recipient.Address,
                     RowKey = operationId,
                 });
@@ -188,18 +315,17 @@ namespace CampaignMailer.Functions
             var blobClient = blobContainer.GetBlobClient(blobName);
             using var stream = new MemoryStream();
             await blobClient.DownloadToAsync(stream);
+            return JsonConvert.DeserializeObject<BlobDto>(Encoding.UTF8.GetString(stream.ToArray()));
+        }
 
-            var blobContentSerializedString = Encoding.UTF8.GetString(stream.ToArray());
+        private async Task<BlobDto> GetBlob(string campaignId)
+        {
+            if (!campaignBlobs.ContainsKey(campaignId))
+            {
+                campaignBlobs.TryAdd(campaignId, await ReadEmailContentFromBlobStream(campaignId));
+            }
 
-            try
-            {
-                var blobContentDeSerialized = JsonConvert.DeserializeObject<BlobDto>(blobContentSerializedString);
-                return blobContentDeSerialized;
-            }
-            catch (Exception)
-            {
-                throw;
-            }
+            return campaignBlobs[campaignId];
         }
 
         private static TableClient InitializeTableClient()
@@ -220,9 +346,10 @@ namespace CampaignMailer.Functions
             return tableClient;
         }
 
-        private EmailRecipients GetEmailRecipients(HashSet<EmailAddress> recipents)
+        private static EmailRecipients GetEmailRecipients(Campaign campaign)
         {
-            return useBcc ? new EmailRecipients(bcc: recipents) : new EmailRecipients(recipents);
+            var recipients = campaign.Recipients.Keys;
+            return campaign.ShouldUseBcc ? new EmailRecipients(bcc: recipients) : new EmailRecipients(recipients);
         }
     }
 }
