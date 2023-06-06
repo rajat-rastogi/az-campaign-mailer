@@ -2,6 +2,6 @@
 {
     internal class ErrorResponse
     {
-        public ErrorDetail Error { get; }
+        public ErrorDetail Error { get; set; }
     }
 }

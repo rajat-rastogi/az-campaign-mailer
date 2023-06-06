@@ -1,5 +1,4 @@
-﻿using Azure.Communication.Email;
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 
 namespace CampaignMailer.Models
 {

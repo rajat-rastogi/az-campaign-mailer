@@ -8,6 +8,7 @@ namespace CampaignMailer.Models
         public string Message { get; set; }
         public string Code { get; set; }
         public HttpStatusCode StatusCode { get; set; }
+        public int RetryAfter { get; set; }
 
         public override string ToString()
         {

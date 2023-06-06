@@ -1,16 +1,9 @@
-﻿using Azure.Communication.Email;
-using CampaignMailer.Models;
-using Microsoft.Extensions.DependencyInjection;
+﻿using CampaignMailer.Models;
 using Newtonsoft.Json;
-using System;
-using System.Collections.Generic;
 using System.Globalization;
-using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace CampaignMailer.Utilities
 {
@@ -24,12 +17,12 @@ namespace CampaignMailer.Utilities
         private readonly Uri requestUri;
         private readonly string accessKey;
 
-        public Mailer(string connectionString, int maxRequestsPerMinute)
+        public Mailer(string connectionString)
         {
             var (resourceEndpoint, accessKey) = ParseConnectionString(connectionString);
             requestUri = new Uri($"{resourceEndpoint}emails:send?api-version={ApiVersion}");
             this.accessKey = accessKey;
-            httpClient = GetHttpClientFactory(maxRequestsPerMinute).CreateClient(nameof(Mailer));
+            httpClient = GetHttpClientFactory().CreateClient(nameof(Mailer));
         }
 
         public async Task<SendMailResponse> SendAsync(Campaign campaign, EmailRecipients recipients, string operationId, CancellationToken cancellationToken = default)
@@ -38,13 +31,8 @@ namespace CampaignMailer.Utilities
             {
                 content = campaign.EmailContent,
                 senderAddress = campaign.SenderEmailAddress,
-                replyTo = new List<EmailAddress> { campaign.ReplyTo },
-                recipients,
-                // ***************** REMOVE *********************
-                headers = new Dictionary<string, string>
-                {
-                    { "x-ms-acsemail-loadtest-skip-email-delivery", "ACS" }
-                }
+                replyTo = new List<Models.EmailAddress> { campaign.ReplyTo },
+                recipients
             };
 
             var serializedBody = JsonConvert.SerializeObject(body);
@@ -100,11 +88,10 @@ namespace CampaignMailer.Utilities
             }
         }
 
-        private static IHttpClientFactory GetHttpClientFactory(int maxRequestsPerMinute)
+        private static IHttpClientFactory GetHttpClientFactory()
         {
             var services = new ServiceCollection();
-            services.AddHttpClient<Mailer>()
-                    .AddHttpMessageHandler(() => new ThrottlingDelegatingHandler(maxRequestsPerMinute));
+            services.AddHttpClient<Mailer>();
             var serviceProvider = services.BuildServiceProvider();
             return serviceProvider.GetService<IHttpClientFactory>();
         }

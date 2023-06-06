@@ -1,15 +1,9 @@
-﻿/*
- * CampaignList function helper class.
- */
-
-using System;
-
-namespace CampaignMailer.Models
+﻿namespace CampaignMailer.Models
 {
     /// <summary>
     /// Campaign configuration data used to encapsulate the HTTP message body data.
     /// </summary>
-    public class CampaignConfiguration
+    public class StartCampaignDto
     {
         public string CampaignId { get; set; }
 
@@ -36,6 +30,8 @@ namespace CampaignMailer.Models
             set { maxRecipientsPerSendMailRequest = Math.Min(Math.Max(value, 1), 50); }
         }
 
-        public bool ShouldUseBcc => maxRecipientsPerSendMailRequest > 1;
+        public bool SkipFetchContacts { get; set; }
+
+        internal bool ShouldUseBcc => maxRecipientsPerSendMailRequest > 1;
     }
 }
